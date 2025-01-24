@@ -43,7 +43,7 @@
 6. **Limited Target Categories:**
    - The current implementation supports only two target categories (e.g., `'person'` and `'car'`). If more categories are needed, the model would need to be extended. This requires retraining the YOLO model and adapting it for new target categories. The lack of flexible category adaptation mechanisms could limit the application of the model in more complex scenarios.
 
-### **Suggestions for Improvement**
+### **todo Suggestions for Improvement**
 
 1. **Improving Target Matching:**
    - Consider using more efficient matching algorithms, such as the Hungarian Algorithm, to replace KNN matching. This could improve matching accuracy and efficiency, especially in scenarios with many targets.
@@ -60,6 +60,4 @@
 5. **Dynamic Tracking Method Adjustment:**
    - Dynamically adjust the usage of the Kalman filter and self-attention based on the target’s movement pattern. Reduce the computational overhead when targets are stationary or moving in a simple pattern, thereby improving efficiency.
 
-### **Conclusion**
 
-Overall, the current model performs well in object detection and tracking, capable of handling multiple targets and utilizing self-attention to enhance dynamic understanding of targets. However, it faces challenges in real-time performance and computational overhead, especially with large numbers of targets or high-resolution video. Enhancements in target matching, memory optimization, and dynamic tracking methods could help mitigate these issues and improve overall performance.
