@@ -4,96 +4,107 @@ import numpy as np
 from sklearn.neighbors import NearestNeighbors
 from ultralytics import YOLO
 import torch.nn as nn
+from filterpy.kalman import KalmanFilter
+import time
 
 # 1. 初始化 YOLOv8 模型
 model = YOLO("yolov8n.pt")  # 使用 YOLOv8 模型
 
-# 2. Transformer 用于目标追踪
-class TrackerTransformer(nn.Module):
-    def __init__(self, input_dim, num_heads, num_layers):
-        super(TrackerTransformer, self).__init__()
 
-        # 确保 input_dim 能被 num_heads 整除
-        assert input_dim % num_heads == 0, "input_dim must be divisible by num_heads"
+# 2. 卡尔曼滤波器类
+class KalmanTracker:
+    def __init__(self):
+        self.kf = KalmanFilter(dim_x=4, dim_z=2)
+        self.kf.F = np.array([[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]])  # 状态转移矩阵
+        self.kf.H = np.array([[1, 0, 0, 0], [0, 1, 0, 0]])  # 观测矩阵
+        self.kf.P *= 1000.  # 初始误差协方差
+        self.tracks = []  # 跟踪列表
 
-        self.transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(d_model=input_dim, nhead=num_heads),
-            num_layers=num_layers
-        )
+    def update(self, detection):
+        self.kf.predict()
+        self.kf.update(detection)
+        return self.kf.x[:2]  # 返回 x, y 位置
 
-    def forward(self, x):
-        return self.transformer(x)
+    def add(self, detection):
+        self.tracks.append(detection)
 
-# 3. 目标追踪器
-class MultiObjectTracker:
-    def __init__(self, input_dim, num_heads, num_layers):
-        self.transformer = TrackerTransformer(input_dim, num_heads, num_layers)
-        self.tracked_objects = []
+    def get_tracks(self):
+        return [track[:2] for track in self.tracks]  # 返回当前跟踪的目标位置
 
-    def track(self, detections):
-        # 将检测到的目标进行 Transformer 处理
-        tracked = self.transformer(detections)
-        return tracked
 
-# 4. KNN 匹配算法
+# 3. KNN 匹配目标
 def knn_tracking(previous_frame, current_frame):
     knn = NearestNeighbors(n_neighbors=1, metric='euclidean')
     knn.fit(previous_frame)
     distances, indices = knn.kneighbors(current_frame)
     return indices, distances
 
+
+# 4. 目标检测与追踪
+def process_frame(frame, tracker, previous_frame, valid_classes):
+    results = model(frame)
+    detections = []
+
+    for result in results[0].boxes:
+        x_min, y_min, x_max, y_max = result.xyxy[0].cpu().numpy()
+        confidence = result.conf[0].cpu().numpy()
+        class_id = result.cls[0].cpu().numpy()
+        class_name = results[0].names[int(class_id)]
+
+        if class_name not in valid_classes:
+            continue
+
+        x_center = (x_min + x_max) / 2
+        y_center = (y_min + y_max) / 2
+        w = x_max - x_min
+        h = y_max - y_min
+
+        detections.append([x_center, y_center, w, h, class_name, confidence])
+
+        label = f"{class_name} ({confidence:.2f})"
+        frame = cv2.rectangle(frame, (int(x_min), int(y_min)), (int(x_max), int(y_max)), (0, 255, 0), 2)
+        draw_text(frame, label, (int(x_min), int(y_min) - 10))
+
+    if len(previous_frame) > 0:
+        indices, distances = knn_tracking(np.array(previous_frame), np.array([det[:4] for det in detections]))
+        print(f"Distances: {distances}")
+        print(f"Matched indices: {indices}")
+
+        # 更新卡尔曼滤波器的目标
+        for i, index in enumerate(indices.flatten()):
+            tracker.update(detections[i][:2])  # 使用检测到的中心位置更新卡尔曼滤波器
+
+    previous_frame = [det[:4] for det in detections]
+    return frame, detections, previous_frame
+
+
 # 5. 使用 OpenCV 绘制英文标签
 def draw_text(img, text, position, font_scale=0.5, color=(255, 255, 255), thickness=1):
-    # 在图像上绘制文本
     cv2.putText(img, text, position, cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness)
 
-# 6. 目标检测与追踪
-def track_objects_in_video(video_path):
-    # 打开视频
-    cap = cv2.VideoCapture(video_path)
-    tracker = MultiObjectTracker(input_dim=4, num_heads=2, num_layers=2)  # 输入维度为4（x_center, y_center, w, h）
 
+# 6. 目标追踪主函数（加入帧率控制）
+def track_objects_in_video(video_path, frame_skip=3):
+    cap = cv2.VideoCapture(video_path)
+    tracker = KalmanTracker()  # 使用卡尔曼滤波器进行目标追踪
     previous_frame = []
+    valid_classes = ['person', 'car']  # 只追踪人和车
+
+    frame_count = 0  # 帧计数
+    start_time = time.time()  # 计算处理时间
+
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
 
-        # 进行目标检测
-        results = model(frame)
+        frame_count += 1
 
-        # results[0] 是一个包含检测框结果的列表
-        detections = []
+        if frame_count % frame_skip != 0:
+            continue  # 跳过多余的帧，不进行处理
 
-        for result in results[0].boxes:  # results[0] 中包含一个名为 boxes 的属性
-            x_min, y_min, x_max, y_max = result.xyxy[0].cpu().numpy()  # 获取框的坐标 (x_min, y_min, x_max, y_max)
-            confidence = result.conf[0].cpu().numpy()  # 获取置信度
-            class_id = result.cls[0].cpu().numpy()  # 获取类别
-            class_name = results[0].names[int(class_id)]  # 获取类别名称
-
-            x_center = (x_min + x_max) / 2
-            y_center = (y_min + y_max) / 2
-            w = x_max - x_min
-            h = y_max - y_min
-
-            detections.append([x_center, y_center, w, h, class_name, confidence])
-
-            # 在图像上绘制目标框和类别标签
-            label = f"{class_name} ({confidence:.2f})"
-
-            frame = cv2.rectangle(frame, (int(x_min), int(y_min)), (int(x_max), int(y_max)), (0, 255, 0), 2)
-
-            # 绘制英文标签
-            draw_text(frame, label, (int(x_min), int(y_min) - 10))
-
-        if len(previous_frame) > 0:
-            # 使用 KNN 进行目标匹配
-            indices, distances = knn_tracking(np.array(previous_frame), np.array([det[:4] for det in detections]))
-            print(f"Distances: {distances}")
-            print(f"Matched indices: {indices}")
-
-        # 更新 previous_frame
-        previous_frame = [det[:4] for det in detections]
+        # 开始处理这一帧
+        frame, detections, previous_frame = process_frame(frame, tracker, previous_frame, valid_classes)
 
         # 显示视频帧
         cv2.imshow("Tracked Objects", frame)
@@ -102,10 +113,14 @@ def track_objects_in_video(video_path):
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
+        # 每秒处理的帧数
+        if frame_count % 30 == 0:
+            elapsed_time = time.time() - start_time
+            print(f"FPS: {frame_count / elapsed_time:.2f}")
+
     cap.release()
     cv2.destroyAllWindows()
 
+
 # 运行目标追踪
-track_objects_in_video('test.mp4')  # 替换为你的视频文件路径
-
-
+track_objects_in_video('test.mp4', frame_skip=3)  # 替换为你的视频文件路径
